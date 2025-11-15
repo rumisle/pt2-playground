@@ -1,7 +1,8 @@
 import os
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, StaticCache
+from threading import Thread
+from transformers import AutoModelForCausalLM, AutoTokenizer, StaticCache, TextIteratorStreamer
 
 model_name = "Qwen/Qwen3-0.6B"
 
@@ -25,6 +26,10 @@ text = tokenizer.apply_chat_template(
 )
 model_inputs = tokenizer([text], return_tensors="pt").to(device)
 
+streamer = TextIteratorStreamer(tokenizer, skip_special_tokens=False)
+generate_kwargs = {k: v for k, v in model_inputs.items()}
+generate_kwargs["streamer"] = streamer
+
 # conduct text completion
 if os.getenv("ENABLE_TORCH_COMPILE", "0") == "1":
     print("Compiling the model with torch.compile")
@@ -40,18 +45,31 @@ if os.getenv("ENABLE_TORCH_COMPILE", "0") == "1":
         max_cache_len=model_inputs.input_ids.shape[1] + 1,
     )
 
-    # import depyf
-    # with depyf.prepare_debug("depyf_qwen3"):
-    generated_ids = model.generate(
-        **model_inputs,
-        max_new_tokens=1,
-        past_key_values=past_key_values,
+    generate_kwargs.update(
+        {
+            "max_new_tokens": 1,
+            "past_key_values": past_key_values,
+        }
     )
 else:
-    generated_ids = model.generate(
-        **model_inputs,
-        max_new_tokens=128,
-    )
+    generate_kwargs["max_new_tokens"] = 128
+
+generated_sequences = []
+
+
+def generate():
+    generated_sequences.append(model.generate(**generate_kwargs))
+
+
+print("Model response (streaming):", flush=True)
+generation_thread = Thread(target=generate)
+generation_thread.start()
+for text_chunk in streamer:
+    print(text_chunk, end="", flush=True)
+generation_thread.join()
+print()
+
+generated_ids = generated_sequences[0]
 output_ids = generated_ids[0][len(model_inputs.input_ids[0]) :].tolist()
 
 # parsing thinking content
